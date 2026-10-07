@@ -1,75 +1,103 @@
 # LuluStream Bot
 
-A Telegram bot for sending video sources to LuluStream.
+A personal Telegram bot that accepts a `.torrent`, downloads the torrent's video files, uploads them to LuluStream, and returns the resulting player links.
 
-## Large Telegram file architecture
+## What it does
 
-For files larger than the public Telegram Bot API download limit, the bot uses Telegram's self-hosted Local Bot API Server:
+```
+Telegram .torrent
+      ↓
+Local Telegram Bot API
+      ↓
+WebTorrent
+      ↓
+Download video files to temporary disk
+      ↓
+LuluStream
+      ↓
+Player links returned in Telegram
+```
 
-Telegram file
-→ Local Bot API Server
-→ temporary file on shared storage
-→ bot HTTPS streaming endpoint
-→ LuluStream remote URL upload
-→ LuluStream file code/player
+The bot processes one torrent at a time per Telegram user. Multiple users can have independent jobs.
 
-The bot does not read the entire video into Node memory. The temporary file is streamed to LuluStream and automatically removed after processing or after the configured TTL.
+## Commands
 
-Telegram's Local Bot API Server supports unlimited file downloads and uploads up to 2000 MB in local mode.
+- `/start` — show help
+- `/folders` — choose the LuluStream destination folder
+- `/status` — show whether your torrent job is running
+- `/cancel` — request cancellation of your current torrent job
+- `/upload <direct-video-url>` — send a directly reachable video URL to LuluStream
 
-## Workflow
-
-1. Forward/send a Telegram video or document to the bot.
-2. The bot gets the Telegram file.
-3. LuluStream is given a temporary HTTPS URL served by the bot.
-4. LuluStream fetches the file directly from that URL.
-5. The bot polls LuluStream until the file is playable.
-6. The bot returns the file code and player URL.
-7. Temporary storage is cleaned up automatically.
-
-You can also use:
-
-`/upload <direct-video-url>`
-
-for sources that already have a direct, publicly reachable URL.
+For torrent uploads, choose a folder with `/folders`, then send a `.torrent` document.
 
 ## Requirements
 
-- Node.js 20+ for a non-Docker setup.
-- Docker + Docker Compose for the included deployment.
-- Telegram API ID and API hash from Telegram's API development tools.
-- A public HTTPS URL for the bot service so LuluStream can reach the temporary stream.
-- Enough temporary disk space for the largest file being processed. A 1.5 GB file needs at least that much free space while it is staged.
+The included Docker Compose setup is the recommended beginner setup.
+
+You need:
+
+- Docker Desktop or Docker Engine + Compose
+- A Telegram bot token from BotFather
+- Telegram API ID and API hash
+- A LuluStream API key
+- Enough free disk space for the torrent currently being downloaded
+- Your Telegram user ID if you want to lock the bot to yourself
+
+The local Telegram Bot API server is included so the bot is not limited by the normal public Bot API file-download restriction. It requires the Telegram API ID/hash.
 
 ## Setup
 
-1. Create `.env` from `.env.example`.
-2. Set:
+1. Clone this repository.
+2. Copy `.env.example` to `.env`.
+3. Fill in the values:
    - `BOT_TOKEN`
    - `LULUSTREAM_API_KEY`
    - `TELEGRAM_API_ID`
    - `TELEGRAM_API_HASH`
-   - `PUBLIC_FILE_BASE_URL`
-   - optionally `ALLOWED_USER_IDS`
-3. Before switching a bot to the Local Bot API Server, call Telegram's `logOut` method on the public Bot API so the bot is deregistered there.
-4. Start the stack:
+   - `ALLOWED_USER_IDS`
+4. Stop any existing instance of the bot.
+5. Before using the local Bot API for the first time, deregister the bot from Telegram's public Bot API with the `logOut` method. This is required when switching a bot to a local Bot API server.
+6. Run:
 
-```
+```bash
 docker compose up -d --build
 ```
 
-5. Put the bot service behind HTTPS and set `PUBLIC_FILE_BASE_URL` to that HTTPS origin.
+7. Watch the logs:
 
-The included Telegram Bot API image is a community Docker image packaging Telegram's official `tdlib/telegram-bot-api` server.
+```bash
+docker compose logs -f bot
+```
 
-## Security
+You should see:
 
-- Never commit `.env`.
-- Keep the Telegram Bot API server private; only the bot service needs to reach it.
-- The temporary stream endpoint uses random job IDs and is not listed publicly.
-- Do not log Telegram bot tokens or temporary file URLs.
-- Restrict the bot with `ALLOWED_USER_IDS` when it is intended for personal use.
+```
+LuluStream bot started
+```
+
+## First use
+
+Open your bot in Telegram:
+
+1. Send `/start`.
+2. Send `/folders`.
+3. Pick the LuluStream folder.
+4. Send a small legal/test `.torrent`.
+5. Wait for the bot to download and upload each video.
+6. The bot will return the LuluStream player links.
+
+Use `/status` while a job is running. Use `/cancel` if you need to stop it.
+
+## Environment
+
+`ALLOWED_USER_IDS` is strongly recommended for a personal bot. Put your Telegram numeric user ID there. Multiple IDs can be separated with commas.
+
+Never commit `.env` or expose your Telegram/LuluStream keys.
+
+## Storage
+
+Torrent data is temporary and is deleted after the job finishes or fails. Keep enough free disk space for the largest torrent/video being processed.
 
 ## Copyright
 
-Only upload videos you have the right or permission to store and distribute through your hosting account.
+Only upload videos that you have the legal right or permission to store and distribute through your hosting account.
