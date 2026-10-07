@@ -88,6 +88,7 @@ async function processTorrent(ctx,p,folder,job){
   }
 }
 
+bot.command("id",async ctx=>ctx.reply("🆔 Your Telegram user ID: `"+ctx.from.id+"`",{parse_mode:"Markdown"}));
 bot.command("start",async ctx=>{
   if(!ok(ctx))return ctx.reply("You are not authorized to use this bot.");
   return ctx.reply("👋 LuluStream Bot is ready.\n\nUse /folders, select a folder, then send a .torrent file.");
