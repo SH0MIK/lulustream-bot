@@ -6,7 +6,7 @@ import { pipeline } from "node:stream/promises";
 import FormData from "form-data";
 import { Bot, InlineKeyboard } from "grammy";
 import WebTorrent from "webtorrent";
-import { listFolders, uploadByUrl, getUploadServer } from "./lulustream.js";
+import { listFolders, uploadByUrl, uploadFile } from "./lulustream.js";
 
 const token=process.env.BOT_TOKEN;
 if(!token) throw new Error("BOT_TOKEN is not configured");
@@ -38,18 +38,8 @@ async function folders(ctx){
 }
 
 async function uploadStream(file,fldId,name){
-  const server=await getUploadServer();
-  const form=new FormData();
-  form.append("key",process.env.LULUSTREAM_API_KEY);
-  form.append("fld_id",String(fldId));
-  form.append("file",file.createReadStream(),{filename:name});
-  const r=await fetch(server,{method:"POST",headers:form.getHeaders(),body:form});
-  if(!r.ok)throw new Error("LuluStream upload failed: HTTP "+r.status);
-  const d=await r.json();
-  if(d.status&&Number(d.status)!==200)throw new Error(d.msg||"LuluStream upload failed");
-  const item=d.files?.find(x=>x.status==="OK")||d.files?.[0];
-  if(!item?.filecode)throw new Error("No file code returned for "+name);
-  return item.filecode;
+  const filePath=path.join(file.torrent.path,file.path);
+  return uploadFile(filePath,fldId,name);
 }
 
 async function processTorrent(ctx,p,folder){
@@ -57,9 +47,11 @@ async function processTorrent(ctx,p,folder){
   let torrent;
   try{
     const msg=await ctx.reply("📂 "+folder.name+"\n\n⏳ Reading torrent...");
+    const downloadRoot=path.join(os.tmpdir(),"lulustream-torrents",String(ctx.from.id),String(Date.now()));
+    fs.mkdirSync(downloadRoot,{recursive:true});
     torrent=await new Promise((resolve,reject)=>{
-      let done=false;
-      const t=client.add(p,{strategy:"sequential"},x=>{if(!done){done=true;resolve(x);}});
+      let settled=false;
+      const t=client.add(p,{path:downloadRoot},x=>{if(!settled){settled=true;resolve(x);}});
       t.on("error",reject);client.on("error",reject);
     });
     const videos=torrent.files.filter(x=>isVideo(x.name));
@@ -70,6 +62,15 @@ async function processTorrent(ctx,p,folder){
       const file=videos[i],name=path.basename(file.name);
       await ctx.api.editMessageText(ctx.chat.id,msg.message_id,"📂 "+folder.name+"\n\n⬇️/⬆️ "+(i+1)+"/"+videos.length+"\n"+name+"\n"+bytes(file.length)+"\n\nStreaming torrent data directly to LuluStream...");
       file.select();
+      await new Promise((resolve,reject)=>{
+        if(file.progress>=1)return resolve();
+        const onDone=()=>{cleanup();resolve();};
+        const onError=err=>{cleanup();reject(err);};
+        const cleanup=()=>{file.off("done",onDone);torrent.off("error",onError);};
+        file.on("done",onDone);
+        torrent.on("error",onError);
+      });
+      await ctx.api.editMessageText(ctx.chat.id,msg.message_id,"📂 "+folder.name+"\n\n☑️ Downloaded "+(i+1)+"/"+videos.length+"\n"+name+"\n"+bytes(file.length)+"\n\n☁️ Uploading to LuluStream...");
       const code=await uploadStream(file,folder.fld_id,name);
       links.push("▶️ https://lulustream.com/"+code+".html");
       try{file.deselect();}catch{}
@@ -77,8 +78,9 @@ async function processTorrent(ctx,p,folder){
     }
     await ctx.api.editMessageText(ctx.chat.id,msg.message_id,"🎉 Torrent finished!\n\n📂 "+folder.name+"\n🎬 Uploaded: "+links.length+"\n\n"+links.join("\n"));
   }finally{
-    try{if(torrent)await torrent.destroy();}catch{}
+    try{if(torrent)await torrent.destroy({destroyStore:true});}catch{}
     try{await client.destroy();}catch{}
+    try{fs.rmSync(torrent?.path,{force:true,recursive:true});}catch{}
     try{fs.rmSync(p,{force:true});}catch{}
   }
 }
