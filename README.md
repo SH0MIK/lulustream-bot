@@ -1,103 +1,246 @@
 # LuluStream Bot
 
-A personal Telegram bot that accepts a `.torrent`, downloads the torrent's video files, uploads them to LuluStream, and returns the resulting player links.
+A personal Telegram bot that accepts a `.torrent`, downloads the torrent's video files with WebTorrent, uploads them to LuluStream, and returns the resulting player links.
 
-## What it does
+## Railway architecture
+
+The recommended deployment is **one Railway service**:
 
 ```
-Telegram .torrent
-      ↓
-Local Telegram Bot API
-      ↓
+Telegram
+   ↓
+Telegram Bot API (torrent metadata only)
+   ↓
+Railway LuluStream Bot
+   ↓
 WebTorrent
-      ↓
-Download video files to temporary disk
-      ↓
+   ↓
+Railway Volume (/data/torrents)
+   ↓
 LuluStream
-      ↓
-Player links returned in Telegram
+   ↓
+Links returned in Telegram
 ```
 
-The bot processes one torrent at a time per Telegram user. Multiple users can have independent jobs.
+The bot does **not** need Telegram's Local Bot API. The only Telegram file it downloads is the `.torrent` metadata file; the actual video data comes from the torrent peers. This keeps the Railway setup to one service.
+
+> Telegram's public Bot API currently limits bot file downloads to 20 MB. Torrent metadata files are normally far smaller. The bot rejects a `.torrent` over 20 MB with a clear error.
+
+## Features
+
+- Select a LuluStream destination folder with inline buttons.
+- Send a `.torrent` and automatically process its video files.
+- Supports MP4, MKV, WebM, MOV, AVI, M4V, TS, M2TS, MPEG, MPG, WMV, FLV and 3GP.
+- Processes video files sequentially to keep disk usage predictable.
+- Uploads each completed video to LuluStream.
+- Returns LuluStream player links.
+- `/cancel` stops the current torrent job.
+- `/status` shows whether a job is running.
+- `/upload <direct-video-url>` submits a direct URL to LuluStream.
+- Optional Telegram-user allowlist for a private bot.
+- Temporary torrent/video data is removed when a job finishes or fails.
 
 ## Commands
 
 - `/start` — show help
+- `/id` — show your Telegram numeric user ID
 - `/folders` — choose the LuluStream destination folder
-- `/status` — show whether your torrent job is running
-- `/cancel` — request cancellation of your current torrent job
-- `/upload <direct-video-url>` — send a directly reachable video URL to LuluStream
+- `/status` — show current job status
+- `/cancel` — cancel the current torrent job
+- `/upload <direct-video-url>` — submit a direct video URL to LuluStream
 
-For torrent uploads, choose a folder with `/folders`, then send a `.torrent` document.
+## Railway setup — beginner guide
 
-## Requirements
+### 1. Create the Telegram bot
 
-The included Docker Compose setup is the recommended beginner setup.
+Open Telegram and talk to **@BotFather**.
 
-You need:
+Use:
 
-- Docker Desktop or Docker Engine + Compose
-- A Telegram bot token from BotFather
-- Telegram API ID and API hash
-- A LuluStream API key
-- Enough free disk space for the torrent currently being downloaded
-- Your Telegram user ID if you want to lock the bot to yourself
-
-The local Telegram Bot API server is included so the bot is not limited by the normal public Bot API file-download restriction. It requires the Telegram API ID/hash.
-
-## Setup
-
-1. Clone this repository.
-2. Copy `.env.example` to `.env`.
-3. Fill in the values:
-   - `BOT_TOKEN`
-   - `LULUSTREAM_API_KEY`
-   - `TELEGRAM_API_ID`
-   - `TELEGRAM_API_HASH`
-   - `ALLOWED_USER_IDS`
-4. Stop any existing instance of the bot.
-5. Before using the local Bot API for the first time, deregister the bot from Telegram's public Bot API with the `logOut` method. This is required when switching a bot to a local Bot API server.
-6. Run:
-
-```bash
-docker compose up -d --build
+```
+/newbot
 ```
 
-7. Watch the logs:
+Follow the prompts and copy the bot token.
 
-```bash
-docker compose logs -f bot
+Keep the token private.
+
+### 2. Get your LuluStream API key
+
+Use the LuluStream API key you already use for your AniVault/LuluStream integration.
+
+Keep it private.
+
+### 3. Create a Railway project
+
+In Railway:
+
+1. Create a new project.
+2. Choose **Deploy from GitHub repo**.
+3. Select `SH0MIK/lulustream-bot`.
+4. Railway should detect the included Dockerfile.
+5. Let the first deployment build.
+
+The bot is a worker and does not need a public HTTP domain.
+
+### 4. Add environment variables
+
+In the Railway service, open **Variables** and add:
+
+```
+BOT_TOKEN=your_telegram_bot_token
+LULUSTREAM_API_KEY=your_lulustream_api_key
+ALLOWED_USER_IDS=
+TORRENT_DATA_DIR=/data/torrents
 ```
 
-You should see:
+You can leave `ALLOWED_USER_IDS` empty during the first test.
+
+After you know your Telegram ID, put it there, for example:
+
+```
+ALLOWED_USER_IDS=123456789
+```
+
+Multiple users can be separated with commas.
+
+### 5. Add a Railway Volume
+
+This is strongly recommended because torrent/video data can be large.
+
+In the bot service:
+
+1. Add a **Volume**.
+2. Mount it at:
+
+```
+/data
+```
+
+The bot automatically uses:
+
+```
+/data/torrents
+```
+
+for temporary torrent/video data.
+
+The volume is temporary working storage for active jobs; completed files are uploaded to LuluStream and then removed.
+
+**Important:** choose enough storage for the largest torrent you expect to process. A torrent containing a 10 GB video can temporarily require roughly 10 GB of local working space.
+
+### 6. Deploy
+
+After adding the variables and volume, trigger a deployment.
+
+Check **Deployments** and then **Logs**.
+
+A healthy bot should show:
 
 ```
 LuluStream bot started
 ```
 
-## First use
+### 7. Lock the bot to yourself
 
-Open your bot in Telegram:
+Open the bot in Telegram and send:
+
+```
+/id
+```
+
+It will return your numeric Telegram ID.
+
+Put that ID into Railway:
+
+```
+ALLOWED_USER_IDS=YOUR_ID
+```
+
+Redeploy.
+
+Now other Telegram users cannot use the bot.
+
+### 8. First test
+
+In Telegram:
 
 1. Send `/start`.
 2. Send `/folders`.
-3. Pick the LuluStream folder.
+3. Select a LuluStream folder.
 4. Send a small legal/test `.torrent`.
-5. Wait for the bot to download and upload each video.
-6. The bot will return the LuluStream player links.
+5. The bot finds video files.
+6. WebTorrent downloads them to the Railway volume.
+7. Each video is uploaded to LuluStream.
+8. The bot sends the resulting links.
+9. The temporary torrent/video data is cleaned up.
 
-Use `/status` while a job is running. Use `/cancel` if you need to stop it.
+Use `/status` while it runs and `/cancel` if you need to stop it.
 
-## Environment
+## Railway environment variables
 
-`ALLOWED_USER_IDS` is strongly recommended for a personal bot. Put your Telegram numeric user ID there. Multiple IDs can be separated with commas.
+| Variable | Required | Purpose |
+|---|---|---|
+| `BOT_TOKEN` | Yes | Telegram bot token |
+| `LULUSTREAM_API_KEY` | Yes | LuluStream API authentication |
+| `ALLOWED_USER_IDS` | Recommended | Restrict the bot to specific Telegram users |
+| `TORRENT_DATA_DIR` | Recommended | Working directory for torrent/video data |
 
-Never commit `.env` or expose your Telegram/LuluStream keys.
+## Local Docker
 
-## Storage
+Docker Compose is also included for testing without Railway:
 
-Torrent data is temporary and is deleted after the job finishes or fails. Keep enough free disk space for the largest torrent/video being processed.
+```bash
+copy .env.example .env
+docker compose up -d --build
+docker compose logs -f bot
+```
+
+No Local Telegram Bot API service is required.
+
+## Important limitations
+
+### Torrent metadata size
+
+The public Telegram Bot API currently allows bots to download files up to 20 MB through `getFile`. The bot therefore rejects `.torrent` files larger than 20 MB.
+
+This is normally not an issue because a torrent file is metadata, not the video itself.
+
+### Railway storage
+
+The torrent's actual video data is downloaded to the Railway volume before LuluStream upload. Storage requirements therefore depend on the size of the video currently being processed.
+
+### Restarting a job
+
+Jobs are held in memory. If the Railway service restarts while a torrent is running, that job will stop and its temporary files will be cleaned up on the next normal process cleanup/startup cycle. There is no persistent job queue yet.
+
+### Upload retries
+
+A failed LuluStream upload currently fails that torrent job rather than retrying indefinitely.
+
+## Security
+
+Never commit `.env` or expose:
+
+- Telegram bot token
+- LuluStream API key
+
+For a personal bot, always set `ALLOWED_USER_IDS`.
 
 ## Copyright
 
 Only upload videos that you have the legal right or permission to store and distribute through your hosting account.
+
+## Development
+
+Install dependencies:
+
+```bash
+npm install
+```
+
+Run:
+
+```npm
+npm start
+```
