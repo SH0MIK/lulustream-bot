@@ -3,7 +3,6 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { pipeline } from "node:stream/promises";
-import FormData from "form-data";
 import { Bot, InlineKeyboard } from "grammy";
 import WebTorrent from "webtorrent";
 import { listFolders, uploadByUrl, uploadFile } from "./lulustream.js";
@@ -37,8 +36,8 @@ async function folders(ctx){
   return ctx.reply("📂 Choose the LuluStream destination folder:",{reply_markup:kb});
 }
 
-async function uploadStream(file,fldId,name){
-  const filePath=path.join(file.torrent.path,file.path);
+async function uploadStream(torrent,file,fldId,name){
+  const filePath=path.join(torrent.path,file.path);
   return uploadFile(filePath,fldId,name);
 }
 
@@ -71,7 +70,7 @@ async function processTorrent(ctx,p,folder){
         torrent.on("error",onError);
       });
       await ctx.api.editMessageText(ctx.chat.id,msg.message_id,"📂 "+folder.name+"\n\n☑️ Downloaded "+(i+1)+"/"+videos.length+"\n"+name+"\n"+bytes(file.length)+"\n\n☁️ Uploading to LuluStream...");
-      const code=await uploadStream(file,folder.fld_id,name);
+      const code=await uploadStream(torrent,file,folder.fld_id,name);
       links.push("▶️ https://lulustream.com/"+code+".html");
       try{file.deselect();}catch{}
       await ctx.api.editMessageText(ctx.chat.id,msg.message_id,"✅ "+(i+1)+"/"+videos.length+" uploaded\n📄 "+name+"\n\n"+links.join("\n"));
