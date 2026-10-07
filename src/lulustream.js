@@ -26,8 +26,62 @@ async function apiGet(path, params = {}) {
   return data;
 }
 
-export function uploadByUrl(url) {
-  return apiGet("/upload/url", { url });
+export async function listFolders(parentId = 0) {
+  const data = await apiGet("/folder/list", { fld_id: parentId, files: 0 });
+  return data.result?.folders || [];
+}
+
+export async function getUploadServer() {
+  const data = await apiGet("/upload/server");
+  const server = data.result;
+  if (!server || typeof server !== "string") {
+    throw new Error("LuluStream did not return an upload server");
+  }
+  return server;
+}
+
+export async function uploadFile(filePath, fldId = 0, name) {
+  const { default: fs } = await import("node:fs");
+  const { default: FormData } = await import("form-data");
+  const server = await getUploadServer();
+  const stat = await fs.promises.stat(filePath);
+  const form = new FormData();
+
+  form.append("key", process.env.LULUSTREAM_API_KEY);
+  form.append("fld_id", String(fldId));
+  form.append("file", fs.createReadStream(filePath), {
+    filename: name,
+    knownLength: stat.size
+  });
+
+  const response = await fetch(server, {
+    method: "POST",
+    headers: {
+      ...form.getHeaders(),
+      "Content-Length": String(form.getLengthSync())
+    },
+    body: form
+  });
+
+  if (!response.ok) {
+    throw new Error(`LuluStream upload failed: HTTP ${response.status}`);
+  }
+
+  const data = await response.json();
+  if (data.status && Number(data.status) !== 200) {
+    throw new Error(data.msg || "LuluStream upload failed");
+  }
+
+  const item = data.files?.find(x => x.status === "OK") || data.files?.[0];
+  if (!item?.filecode) {
+    throw new Error("LuluStream did not return a file code");
+  }
+
+  return item.filecode;
+}
+
+export function uploadByUrl(url, fldId = 0) {
+  return apiGet("/upload/url", { url, fld_id: fldId });
 }
 
 export function getFileInfo(fileCode) {
