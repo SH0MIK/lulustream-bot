@@ -10,9 +10,10 @@ import { listFolders, uploadByUrl, uploadFile } from "./lulustream.js";
 const token=process.env.BOT_TOKEN;
 if(!token) throw new Error("BOT_TOKEN is not configured");
 const allowed=new Set((process.env.ALLOWED_USER_IDS||"").split(",").map(x=>x.trim()).filter(Boolean));
-const bot=new Bot(token);
+const telegramApiRoot=(process.env.TELEGRAM_API_ROOT||"https://api.telegram.org").replace(/\/$/,"");
+const bot=new Bot(token,{client:{apiRoot:telegramApiRoot+"/bot"}});
 const selected=new Map();
-const active=new Set();
+const active=new Map();
 const VIDEO=new Set([".mp4",".mkv",".webm",".mov",".avi",".m4v",".ts",".m2ts",".mpeg",".mpg",".wmv",".flv",".3gp"]);
 
 function ok(ctx){return !allowed.size||allowed.has(String(ctx.from?.id));}
@@ -22,7 +23,7 @@ function bytes(n){if(!Number.isFinite(n))return"0 B";const u=["B","KB","MB","GB"
 async function getTorrent(ctx,id){
   const f=await ctx.api.getFile(id);
   if(!f.file_path)throw new Error("Telegram did not return the torrent path.");
-  const r=await fetch("https://api.telegram.org/file/bot"+token+"/"+f.file_path);
+  const r=await fetch(telegramApiRoot+"/file/bot"+token+"/"+f.file_path);
   if(!r.ok)throw new Error("Telegram download failed: HTTP "+r.status);
   const p=path.join(os.tmpdir(),"torrent-"+Date.now()+".torrent");
   await pipeline(r.body,fs.createWriteStream(p)); return p;
@@ -41,7 +42,7 @@ async function uploadStream(torrent,file,fldId,name){
   return uploadFile(filePath,fldId,name);
 }
 
-async function processTorrent(ctx,p,folder){
+async function processTorrent(ctx,p,folder,job){
   const client=new WebTorrent();
   let torrent;
   try{
@@ -58,14 +59,17 @@ async function processTorrent(ctx,p,folder){
     await ctx.api.editMessageText(ctx.chat.id,msg.message_id,"📂 "+folder.name+"\n🎬 "+videos.length+" videos found\n\nStarting queue...");
     const links=[];
     for(let i=0;i<videos.length;i++){
+      if(job?.cancelled)throw new Error("Job cancelled.");
       const file=videos[i],name=path.basename(file.name);
       await ctx.api.editMessageText(ctx.chat.id,msg.message_id,"📂 "+folder.name+"\n\n⬇️/⬆️ "+(i+1)+"/"+videos.length+"\n"+name+"\n"+bytes(file.length)+"\n\nStreaming torrent data directly to LuluStream...");
       file.select();
       await new Promise((resolve,reject)=>{
+        if(job?.cancelled)return reject(new Error("Job cancelled."));
         if(file.progress>=1)return resolve();
         const onDone=()=>{cleanup();resolve();};
         const onError=err=>{cleanup();reject(err);};
-        const cleanup=()=>{file.off("done",onDone);torrent.off("error",onError);};
+        const interval=setInterval(()=>{if(job?.cancelled){cleanup();reject(new Error("Job cancelled."));}},1000);
+        const cleanup=()=>{clearInterval(interval);file.off("done",onDone);torrent.off("error",onError);};
         file.on("done",onDone);
         torrent.on("error",onError);
       });
@@ -102,6 +106,18 @@ bot.callbackQuery(/^folder:(.+)$/,async ctx=>{
     await ctx.editMessageText("✅ Destination selected\n\n📂 "+f.name+"\n\nNow send the .torrent file.");
   }catch(e){await ctx.answerCallbackQuery({text:"Folder selection failed",show_alert:true});}
 });
+bot.command("cancel",async ctx=>{
+  if(!ok(ctx))return ctx.reply("You are not authorized to use this bot.");
+  const job=active.get(String(ctx.from.id));
+  if(!job)return ctx.reply("ℹ️ You have no active torrent job.");
+  job.cancelled=true;
+  return ctx.reply("🛑 Cancellation requested. Cleaning up the torrent...");
+});
+bot.command("status",async ctx=>{
+  if(!ok(ctx))return ctx.reply("You are not authorized to use this bot.");
+  const job=active.get(String(ctx.from.id));
+  return ctx.reply(job?"⏳ A torrent job is currently running.":"✅ No active torrent job.");
+});
 bot.command("upload",async ctx=>{
   if(!ok(ctx))return ctx.reply("You are not authorized to use this bot.");
   const url=ctx.match?.trim(),folder=selected.get(String(ctx.from.id));
@@ -123,8 +139,8 @@ bot.on("message:document",async ctx=>{
   if(!folder)return ctx.reply("📂 Choose a destination with /folders first.");
   const uid=String(ctx.from.id);
   if(active.has(uid))return ctx.reply("⏳ You already have a torrent running.");
-  active.add(uid);let p;
-  try{await ctx.reply("📦 Torrent received. Preparing it...");p=await getTorrent(ctx,doc.file_id);await processTorrent(ctx,p,folder);}
+  active.set(uid,{cancelled:false});let p;
+  try{await ctx.reply("📦 Torrent received. Preparing it...");p=await getTorrent(ctx,doc.file_id);await processTorrent(ctx,p,folder,active.get(uid));}
   catch(e){await ctx.reply("❌ Torrent job failed: "+e.message);if(p)try{fs.rmSync(p,{force:true});}catch{}}
   finally{active.delete(uid);}
 });
