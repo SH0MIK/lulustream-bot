@@ -10,8 +10,8 @@ import { listFolders, uploadByUrl, uploadFile } from "./lulustream.js";
 const token=process.env.BOT_TOKEN;
 if(!token) throw new Error("BOT_TOKEN is not configured");
 const allowed=new Set((process.env.ALLOWED_USER_IDS||"").split(",").map(x=>x.trim()).filter(Boolean));
-const telegramApiRoot=(process.env.TELEGRAM_API_ROOT||"https://api.telegram.org").replace(/\/$/,"");
-const bot=new Bot(token,{client:{apiRoot:telegramApiRoot+"/bot"}});
+const telegramApiRoot="https://api.telegram.org";
+const bot=new Bot(token);
 const selected=new Map();
 const active=new Map();
 const VIDEO=new Set([".mp4",".mkv",".webm",".mov",".avi",".m4v",".ts",".m2ts",".mpeg",".mpg",".wmv",".flv",".3gp"]);
@@ -23,6 +23,9 @@ function bytes(n){if(!Number.isFinite(n))return"0 B";const u=["B","KB","MB","GB"
 async function getTorrent(ctx,id){
   const f=await ctx.api.getFile(id);
   if(!f.file_path)throw new Error("Telegram did not return the torrent path.");
+  if(f.file_size && f.file_size > 20 * 1024 * 1024){
+    throw new Error("The .torrent file is larger than Telegram's public Bot API 20 MB download limit.");
+  }
   const r=await fetch(telegramApiRoot+"/file/bot"+token+"/"+f.file_path);
   if(!r.ok)throw new Error("Telegram download failed: HTTP "+r.status);
   const p=path.join(os.tmpdir(),"torrent-"+Date.now()+".torrent");
@@ -47,7 +50,8 @@ async function processTorrent(ctx,p,folder,job){
   let torrent;
   try{
     const msg=await ctx.reply("📂 "+folder.name+"\n\n⏳ Reading torrent...");
-    const downloadRoot=path.join(os.tmpdir(),"lulustream-torrents",String(ctx.from.id),String(Date.now()));
+    const baseTmp=process.env.TORRENT_DATA_DIR || path.join(os.tmpdir(),"lulustream-torrents");
+    const downloadRoot=path.join(baseTmp,String(ctx.from.id),String(Date.now()));
     fs.mkdirSync(downloadRoot,{recursive:true});
     torrent=await new Promise((resolve,reject)=>{
       let settled=false;
