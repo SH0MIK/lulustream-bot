@@ -1,287 +1,132 @@
 import "dotenv/config";
-import crypto from "node:crypto";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
-import express from "express";
-import { Bot } from "grammy";
-import { getFileInfo, uploadByUrl } from "./lulustream.js";
+import { pipeline } from "node:stream/promises";
+import FormData from "form-data";
+import { Bot, InlineKeyboard } from "grammy";
+import WebTorrent from "webtorrent";
+import { listFolders, uploadByUrl, getUploadServer } from "./lulustream.js";
 
-const token = process.env.BOT_TOKEN;
-if (!token) throw new Error("BOT_TOKEN is not configured");
+const token=process.env.BOT_TOKEN;
+if(!token) throw new Error("BOT_TOKEN is not configured");
+const allowed=new Set((process.env.ALLOWED_USER_IDS||"").split(",").map(x=>x.trim()).filter(Boolean));
+const bot=new Bot(token);
+const selected=new Map();
+const active=new Set();
+const VIDEO=new Set([".mp4",".mkv",".webm",".mov",".avi",".m4v",".ts",".m2ts",".mpeg",".mpg",".wmv",".flv",".3gp"]);
 
-const telegramApiRoot =
-  process.env.TELEGRAM_API_ROOT || "https://api.telegram.org";
+function ok(ctx){return !allowed.size||allowed.has(String(ctx.from?.id));}
+function isVideo(n){return VIDEO.has(path.extname(n).toLowerCase());}
+function bytes(n){if(!Number.isFinite(n))return"0 B";const u=["B","KB","MB","GB"];let i=0;while(n>=1024&&i<3){n/=1024;i++;}return n.toFixed(i?1:0)+" "+u[i];}
 
-const publicFileBaseUrl = process.env.PUBLIC_FILE_BASE_URL?.replace(/\/$/, "");
-const filePort = Number(process.env.PORT || process.env.FILE_PORT || 3000);
-const fileTtlMs = Number(process.env.FILE_TTL_HOURS || 6) * 60 * 60 * 1000;
-
-const allowed = new Set(
-  (process.env.ALLOWED_USER_IDS || "")
-    .split(",")
-    .map((id) => id.trim())
-    .filter(Boolean)
-);
-
-const bot = new Bot(token, {
-  client: {
-    apiRoot: telegramApiRoot
-  }
-});
-
-const files = new Map();
-const app = express();
-
-function authorized(ctx) {
-  return !allowed.size || allowed.has(String(ctx.from?.id));
+async function getTorrent(ctx,id){
+  const f=await ctx.api.getFile(id);
+  if(!f.file_path)throw new Error("Telegram did not return the torrent path.");
+  const r=await fetch("https://api.telegram.org/file/bot"+token+"/"+f.file_path);
+  if(!r.ok)throw new Error("Telegram download failed: HTTP "+r.status);
+  const p=path.join(os.tmpdir(),"torrent-"+Date.now()+".torrent");
+  await pipeline(r.body,fs.createWriteStream(p)); return p;
 }
 
-function extractFile(message) {
-  if (message.video) {
-    return {
-      fileId: message.video.file_id,
-      name: message.video.file_name || "video.mp4",
-      mime: message.video.mime_type || "video/mp4",
-      size: message.video.file_size
-    };
-  }
-
-  if (message.document) {
-    return {
-      fileId: message.document.file_id,
-      name: message.document.file_name || "video",
-      mime: message.document.mime_type || "application/octet-stream",
-      size: message.document.file_size
-    };
-  }
-
-  return null;
+async function folders(ctx){
+  const list=await listFolders(0);
+  if(!list.length)return ctx.reply("📁 No LuluStream folders found.");
+  const kb=new InlineKeyboard();
+  for(const f of list.slice(0,50))kb.text("📁 "+f.name,"folder:"+f.fld_id).row();
+  return ctx.reply("📂 Choose the LuluStream destination folder:",{reply_markup:kb});
 }
 
-function cleanup(id) {
-  const entry = files.get(id);
-  if (!entry) return;
-
-  files.delete(id);
-  clearTimeout(entry.timer);
-
-  try {
-    fs.rmSync(entry.filePath, { force: true });
-  } catch (error) {
-    console.error("Cleanup failed:", error.message);
-  }
+async function uploadStream(file,fldId,name){
+  const server=await getUploadServer();
+  const form=new FormData();
+  form.append("key",process.env.LULUSTREAM_API_KEY);
+  form.append("fld_id",String(fldId));
+  form.append("file",file.createReadStream(),{filename:name});
+  const r=await fetch(server,{method:"POST",headers:form.getHeaders(),body:form});
+  if(!r.ok)throw new Error("LuluStream upload failed: HTTP "+r.status);
+  const d=await r.json();
+  if(d.status&&Number(d.status)!==200)throw new Error(d.msg||"LuluStream upload failed");
+  const item=d.files?.find(x=>x.status==="OK")||d.files?.[0];
+  if(!item?.filecode)throw new Error("No file code returned for "+name);
+  return item.filecode;
 }
 
-function scheduleCleanup(id, delay = fileTtlMs) {
-  const entry = files.get(id);
-  if (!entry) return;
-
-  clearTimeout(entry.timer);
-  entry.timer = setTimeout(() => cleanup(id), delay);
-}
-
-app.get("/health", (_req, res) => {
-  res.json({ ok: true });
-});
-
-app.get("/stream/:id", (req, res) => {
-  const entry = files.get(req.params.id);
-
-  if (!entry) {
-    res.status(404).send("File unavailable");
-    return;
-  }
-
-  fs.stat(entry.filePath, (error, stat) => {
-    if (error || !stat.isFile()) {
-      res.status(404).send("File unavailable");
-      return;
-    }
-
-    res.setHeader("Content-Type", entry.mime);
-    res.setHeader("Content-Length", stat.size);
-    res.setHeader(
-      "Content-Disposition",
-      `inline; filename="${encodeURIComponent(entry.name)}"`
-    );
-    res.setHeader("Cache-Control", "no-store");
-
-    const stream = fs.createReadStream(entry.filePath);
-    stream.on("error", () => {
-      if (!res.headersSent) res.status(500);
-      res.end();
+async function processTorrent(ctx,p,folder){
+  const client=new WebTorrent();
+  let torrent;
+  try{
+    const msg=await ctx.reply("📂 "+folder.name+"\n\n⏳ Reading torrent...");
+    torrent=await new Promise((resolve,reject)=>{
+      let done=false;
+      const t=client.add(p,{strategy:"sequential"},x=>{if(!done){done=true;resolve(x);}});
+      t.on("error",reject);client.on("error",reject);
     });
-    stream.pipe(res);
-  });
-});
-
-app.listen(filePort, () => {
-  console.log(`File streaming server listening on :${filePort}`);
-});
-
-async function submitTelegramFile(ctx) {
-  if (!authorized(ctx)) {
-    await ctx.reply("You are not authorized to use this bot.");
-    return;
-  }
-
-  if (!publicFileBaseUrl) {
-    await ctx.reply(
-      "Large Telegram uploads are not configured yet. Set PUBLIC_FILE_BASE_URL first."
-    );
-    return;
-  }
-
-  const file = extractFile(ctx.message);
-  if (!file) return;
-
-  if (file.size && file.size > 2_000 * 1024 * 1024) {
-    await ctx.reply("❌ This file is over Telegram local Bot API's 2 GB limit.");
-    return;
-  }
-
-  const status = await ctx.reply(
-    "⏳ Getting the Telegram file ready for LuluStream..."
-  );
-
-  let jobId;
-
-  try {
-    const telegramFile = await ctx.api.getFile(file.fileId);
-
-    if (!telegramFile.file_path) {
-      throw new Error("Telegram did not return a file path.");
+    const videos=torrent.files.filter(x=>isVideo(x.name));
+    if(!videos.length)throw new Error("No supported video files found.");
+    await ctx.api.editMessageText(ctx.chat.id,msg.message_id,"📂 "+folder.name+"\n🎬 "+videos.length+" videos found\n\nStarting queue...");
+    const links=[];
+    for(let i=0;i<videos.length;i++){
+      const file=videos[i],name=path.basename(file.name);
+      await ctx.api.editMessageText(ctx.chat.id,msg.message_id,"📂 "+folder.name+"\n\n⬇️/⬆️ "+(i+1)+"/"+videos.length+"\n"+name+"\n"+bytes(file.length)+"\n\nStreaming torrent data directly to LuluStream...");
+      file.select();
+      const code=await uploadStream(file,folder.fld_id,name);
+      links.push("▶️ https://lulustream.com/"+code+".html");
+      try{file.deselect();}catch{}
+      await ctx.api.editMessageText(ctx.chat.id,msg.message_id,"✅ "+(i+1)+"/"+videos.length+" uploaded\n📄 "+name+"\n\n"+links.join("\n"));
     }
-
-    if (!path.isAbsolute(telegramFile.file_path)) {
-      throw new Error(
-        "This bot is not connected to a local Telegram Bot API server."
-      );
-    }
-
-    jobId = crypto.randomUUID();
-
-    files.set(jobId, {
-      filePath: telegramFile.file_path,
-      name: file.name,
-      mime: file.mime,
-      timer: null
-    });
-
-    scheduleCleanup(jobId);
-
-    const sourceUrl = `${publicFileBaseUrl}/stream/${jobId}`;
-    const result = await uploadByUrl(sourceUrl);
-    const fileCode = result?.result?.filecode;
-
-    if (!fileCode) {
-      throw new Error("LuluStream did not return a file code.");
-    }
-
-    const playerUrl = `https://lulustream.com/${fileCode}.html`;
-
-    await ctx.api.editMessageText(
-      ctx.chat.id,
-      status.message_id,
-      `📤 LuluStream is processing:\n${file.name}\n\n🔑 File code: ${fileCode}\n▶️ Player: ${playerUrl}\n\n⏳ Waiting for processing...`
-    );
-
-    let ready = false;
-
-    for (let attempt = 0; attempt < 120; attempt++) {
-      await new Promise((resolve) => setTimeout(resolve, 5000));
-
-      const response = await getFileInfo(fileCode);
-      const info = response?.result?.[0];
-
-      if (info?.canplay === 1) {
-        ready = true;
-        break;
-      }
-    }
-
-    if (ready) {
-      await ctx.api.editMessageText(
-        ctx.chat.id,
-        status.message_id,
-        `✅ Done!\n\n📄 ${file.name}\n🔑 File code: ${fileCode}\n▶️ Player: ${playerUrl}`
-      );
-      cleanup(jobId);
-    } else {
-      await ctx.api.editMessageText(
-        ctx.chat.id,
-        status.message_id,
-        `⏳ Upload accepted; LuluStream is still processing it.\n\n📄 ${file.name}\n🔑 File code: ${fileCode}\n▶️ Player: ${playerUrl}\n\nThe temporary Telegram file will be cleaned up automatically.`
-      );
-    }
-  } catch (error) {
-    if (jobId) cleanup(jobId);
-
-    await ctx.api.editMessageText(
-      ctx.chat.id,
-      status.message_id,
-      `❌ Upload failed: ${error.message}`
-    );
+    await ctx.api.editMessageText(ctx.chat.id,msg.message_id,"🎉 Torrent finished!\n\n📂 "+folder.name+"\n🎬 Uploaded: "+links.length+"\n\n"+links.join("\n"));
+  }finally{
+    try{if(torrent)await torrent.destroy();}catch{}
+    try{await client.destroy();}catch{}
+    try{fs.rmSync(p,{force:true});}catch{}
   }
 }
 
-bot.command("start", async (ctx) => {
-  await ctx.reply(
-    "LuluStream Bot is online. Send a direct video URL, or forward/send a Telegram video or document."
-  );
+bot.command("start",async ctx=>{
+  if(!ok(ctx))return ctx.reply("You are not authorized to use this bot.");
+  return ctx.reply("👋 LuluStream Bot is ready.\n\nUse /folders, select a folder, then send a .torrent file.");
 });
-
-bot.command("upload", async (ctx) => {
-  if (!authorized(ctx)) {
-    await ctx.reply("You are not authorized to use this bot.");
-    return;
-  }
-
-  const url = ctx.match?.trim();
-
-  if (!url) {
-    await ctx.reply("Usage: /upload <direct-video-url>");
-    return;
-  }
-
-  try {
-    new URL(url);
-  } catch {
-    await ctx.reply("That does not look like a valid URL.");
-    return;
-  }
-
-  const msg = await ctx.reply("⏳ Submitting URL to LuluStream...");
-
-  try {
-    const result = await uploadByUrl(url);
-    const fileCode = result?.result?.filecode;
-
-    if (!fileCode) {
-      throw new Error("LuluStream did not return a file code.");
-    }
-
-    const playerUrl = `https://lulustream.com/${fileCode}.html`;
-
-    await ctx.api.editMessageText(
-      ctx.chat.id,
-      msg.message_id,
-      `✅ LuluStream accepted the remote upload.\n\n🔑 File code: ${fileCode}\n▶️ Player: ${playerUrl}`
-    );
-  } catch (error) {
-    await ctx.api.editMessageText(
-      ctx.chat.id,
-      msg.message_id,
-      `❌ Upload request failed: ${error.message}`
-    );
-  }
+bot.command("folders",async ctx=>{
+  if(!ok(ctx))return ctx.reply("You are not authorized to use this bot.");
+  try{await folders(ctx);}catch(e){await ctx.reply("❌ Folder lookup failed: "+e.message);}
 });
-
-bot.on(["message:video", "message:document"], submitTelegramFile);
-
-bot.catch((err) => {
-  console.error("Bot error:", err.error);
+bot.callbackQuery(/^folder:(.+)$/,async ctx=>{
+  if(!ok(ctx)){await ctx.answerCallbackQuery({text:"Not authorized",show_alert:true});return;}
+  try{
+    const list=await listFolders(0),f=list.find(x=>String(x.fld_id)===String(ctx.match[1]));
+    if(!f){await ctx.answerCallbackQuery({text:"Folder not found",show_alert:true});return;}
+    selected.set(String(ctx.from.id),{fld_id:f.fld_id,name:f.name});
+    await ctx.answerCallbackQuery({text:"Selected "+f.name});
+    await ctx.editMessageText("✅ Destination selected\n\n📂 "+f.name+"\n\nNow send the .torrent file.");
+  }catch(e){await ctx.answerCallbackQuery({text:"Folder selection failed",show_alert:true});}
 });
-
+bot.command("upload",async ctx=>{
+  if(!ok(ctx))return ctx.reply("You are not authorized to use this bot.");
+  const url=ctx.match?.trim(),folder=selected.get(String(ctx.from.id));
+  if(!url)return ctx.reply("Usage: /upload <direct-video-url>");
+  if(!folder)return ctx.reply("📂 Choose a destination with /folders first.");
+  try{new URL(url);}catch{return ctx.reply("❌ Invalid URL.");}
+  const m=await ctx.reply("⏳ Submitting URL...");
+  try{
+    const d=await uploadByUrl(url,folder.fld_id),code=d?.result?.filecode;
+    if(!code)throw new Error("No file code returned.");
+    await ctx.api.editMessageText(ctx.chat.id,m.message_id,"✅ Accepted\n\n📂 "+folder.name+"\n▶️ https://lulustream.com/"+code+".html");
+  }catch(e){await ctx.api.editMessageText(ctx.chat.id,m.message_id,"❌ Upload failed: "+e.message);}
+});
+bot.on("message:document",async ctx=>{
+  if(!ok(ctx))return ctx.reply("You are not authorized to use this bot.");
+  const doc=ctx.message.document,name=(doc.file_name||"").toLowerCase();
+  if(!name.endsWith(".torrent"))return;
+  const folder=selected.get(String(ctx.from.id));
+  if(!folder)return ctx.reply("📂 Choose a destination with /folders first.");
+  const uid=String(ctx.from.id);
+  if(active.has(uid))return ctx.reply("⏳ You already have a torrent running.");
+  active.add(uid);let p;
+  try{await ctx.reply("📦 Torrent received. Preparing it...");p=await getTorrent(ctx,doc.file_id);await processTorrent(ctx,p,folder);}
+  catch(e){await ctx.reply("❌ Torrent job failed: "+e.message);if(p)try{fs.rmSync(p,{force:true});}catch{}}
+  finally{active.delete(uid);}
+});
+bot.catch(e=>console.error("Bot error:",e.error));
 bot.start();
 console.log("LuluStream bot started");
