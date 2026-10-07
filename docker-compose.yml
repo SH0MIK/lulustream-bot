@@ -18,10 +18,9 @@ services:
       - .env
     environment:
       TELEGRAM_API_ROOT: http://telegram-bot-api:8081
-    ports:
-      - "3000:3000"
     volumes:
-      - telegram-data:/var/lib/telegram-bot-api:ro
+      - bot-tmp:/tmp/lulustream-torrents
 
 volumes:
   telegram-data:
+  bot-tmp:
