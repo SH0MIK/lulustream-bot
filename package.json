@@ -9,6 +9,8 @@
   "dependencies": {
     "dotenv": "^16.4.7",
     "express": "^5.1.0",
-    "grammy": "^1.38.1"
+    "grammy": "^1.38.1",
+    "form-data": "^4.0.4",
+    "webtorrent": "^2.8.0"
   }
 }
