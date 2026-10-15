@@ -68,10 +68,12 @@ async function processTorrent(ctx,p,folder,job){
     const msg=await ctx.reply("📂 "+folder.name+"\n\n⏳ Reading torrent...");
     const downloadRoot=path.join(dataDir,String(ctx.from.id),String(Date.now()));
     fs.mkdirSync(downloadRoot,{recursive:true});
+    const torrentBuffer=fs.readFileSync(p);
     torrent=await new Promise((resolve,reject)=>{
       let settled=false;
-      const t=client.add(p,{path:downloadRoot},x=>{if(!settled){settled=true;resolve(x);}});
-      t.on("error",reject);client.on("error",reject);
+      const t=client.add(torrentBuffer,{path:downloadRoot},x=>{if(!settled){settled=true;resolve(x);}});
+      t.on("error",reject);
+      client.on("error",reject);
     });
     const videos=torrent.files.filter(x=>isVideo(x.name));
     if(!videos.length)throw new Error("No supported video files found.");
