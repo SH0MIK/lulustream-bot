@@ -12,8 +12,24 @@ if(!token) throw new Error("BOT_TOKEN is not configured");
 const allowed=new Set((process.env.ALLOWED_USER_IDS||"").split(",").map(x=>x.trim()).filter(Boolean));
 const telegramApiRoot="https://api.telegram.org";
 const bot=new Bot(token);
+const dataDir=process.env.TORRENT_DATA_DIR || path.join(os.tmpdir(),"lulustream-torrents");
+const selectionFile=path.join(dataDir,"selected-folders.json");
 const selected=new Map();
 const active=new Map();
+
+function loadSelections(){
+  try{
+    const saved=JSON.parse(fs.readFileSync(selectionFile,"utf8"));
+    for(const [userId,folder] of Object.entries(saved))selected.set(userId,folder);
+  }catch{}
+}
+function saveSelections(){
+  fs.mkdirSync(path.dirname(selectionFile),{recursive:true});
+  const temp=selectionFile+".tmp";
+  fs.writeFileSync(temp,JSON.stringify(Object.fromEntries(selected)));
+  fs.renameSync(temp,selectionFile);
+}
+loadSelections();
 const VIDEO=new Set([".mp4",".mkv",".webm",".mov",".avi",".m4v",".ts",".m2ts",".mpeg",".mpg",".wmv",".flv",".3gp"]);
 
 function ok(ctx){return !allowed.size||allowed.has(String(ctx.from?.id));}
@@ -50,8 +66,7 @@ async function processTorrent(ctx,p,folder,job){
   let torrent;
   try{
     const msg=await ctx.reply("📂 "+folder.name+"\n\n⏳ Reading torrent...");
-    const baseTmp=process.env.TORRENT_DATA_DIR || path.join(os.tmpdir(),"lulustream-torrents");
-    const downloadRoot=path.join(baseTmp,String(ctx.from.id),String(Date.now()));
+    const downloadRoot=path.join(dataDir,String(ctx.from.id),String(Date.now()));
     fs.mkdirSync(downloadRoot,{recursive:true});
     torrent=await new Promise((resolve,reject)=>{
       let settled=false;
@@ -107,6 +122,7 @@ bot.callbackQuery(/^folder:(.+)$/,async ctx=>{
     const list=await listFolders(0),f=list.find(x=>String(x.fld_id)===String(ctx.match[1]));
     if(!f){await ctx.answerCallbackQuery({text:"Folder not found",show_alert:true});return;}
     selected.set(String(ctx.from.id),{fld_id:f.fld_id,name:f.name});
+    saveSelections();
     await ctx.answerCallbackQuery({text:"Selected "+f.name});
     await ctx.editMessageText("✅ Destination selected\n\n📂 "+f.name+"\n\nNow send the .torrent file.");
   }catch(e){await ctx.answerCallbackQuery({text:"Folder selection failed",show_alert:true});}
@@ -151,4 +167,4 @@ bot.on("message:document",async ctx=>{
 });
 bot.catch(e=>console.error("Bot error:",e.error));
 bot.start();
-console.log("LuluStream bot started");
+console.log("LuluStream bot started; persistent folder selections:",selected.size,"; data directory:",dataDir);
